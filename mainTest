@@ -1,0 +1,378 @@
+package com.vispractice.mc.alarm.service.impl;
+
+import com.vispractice.mc.alarm.domain.request.*;
+import com.vispractice.mc.alarm.service.ZabbixAlarmService;
+import com.vispractice.mc.alarm.service.ZabbixRPCTableService;
+import com.vispractice.mc.monitor.dao.HostDao;
+import com.vispractice.mc.monitor.service.zabbix.ZabbixService;
+import com.ylink.paas.bus.common.exception.ServiceException;
+import com.ylink.paas.common.JsonMapper;
+import com.ylink.paas.common.ZabbixConstants;
+import com.ylink.paas.domain.zabbix.Functions;
+import com.ylink.paas.domain.zabbix.ZabbixHostResp;
+import com.ylink.paas.domain.zabbix.ZabbixItemResp;
+import com.ylink.paas.domain.zabbix.alert.ZabbixAlert;
+import com.ylink.paas.domain.zabbix.event.ZabbixAcknowledge;
+import com.ylink.paas.domain.zabbix.event.ZabbixEvent;
+import com.ylink.paas.domain.zabbix.trigger.ZabbixTrigger;
+import com.ylink.paas.model.monitor.AlarmDealRecord;
+import com.ylink.paas.model.monitor.AlarmView;
+import org.apache.commons.lang.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import com.ylink.paas.model.monitor.Host;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+
+@Service
+public class ZabbixAlarmServiceImpl implements ZabbixAlarmService {
+
+	@Autowired
+	private ZabbixRPCTableService zabbixRPCTableService;
+	@Autowired
+	private ZabbixService zabbixService;
+	@Autowired
+	private HostDao hostDao;
+	private JsonMapper jsonMapper = new JsonMapper();
+	
+	private final static Logger logger = LoggerFactory.getLogger(ZabbixAlarmServiceImpl.class);
+	private static SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");//设置日期格式
+	
+	@Override
+	public List<AlarmView> getAlarmList(List<String> userIds, long startTime, long endTime,String resourceType,String instanceInfo) throws ServiceException{
+		List<AlarmView> alarmViews = null;
+		if(userIds!=null && userIds.size()>0) {
+			ZabbixAlertReq zabbixAlertReq = new ZabbixAlertReq();
+			zabbixAlertReq.setUserids(userIds);
+			zabbixAlertReq.setOutput(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+			zabbixAlertReq.setTime_from(startTime);
+			zabbixAlertReq.setTime_till(endTime);
+			//查询alert表获取已经触发事件的eventIds
+			List<ZabbixAlert> zabbixAlerts= zabbixRPCTableService.getAlertList(zabbixAlertReq);
+			List<String> distinctEventIds=getDistinctEventIds(zabbixAlerts);
+			if(distinctEventIds!=null && distinctEventIds.size()>0) {
+				//查询event表，获取triggerIds,object=0时为触发器类型，objectId此时即为触发器id
+				ZabbixEventReq zabbixEventReq = new ZabbixEventReq();
+				zabbixEventReq.setEventids(distinctEventIds);
+				zabbixEventReq.setObject("0");
+				zabbixEventReq.setOutput(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+				zabbixEventReq.setTime_from(startTime);
+				zabbixEventReq.setTime_till(endTime);
+				//按照触发时间倒序排列
+				zabbixEventReq.setSortfield(new String[]{"clock","eventid"});
+				zabbixEventReq.setSortorder("DESC");
+				//显示事件已经确认的信息的参数设置
+                zabbixEventReq.setSelect_acknowledges(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+				List<ZabbixEvent> zabbixEvents = zabbixRPCTableService.getEventList(zabbixEventReq);
+				alarmViews =  new ArrayList<AlarmView>();
+				//查询trigger表，获取trigger详情
+				List<String> distinctTriggerIds = getDistinctTriggerIds(zabbixEvents,alarmViews);
+				if(distinctTriggerIds != null && distinctTriggerIds.size()>0) {
+					ZabbixTriggerReq zabbixTriggerReq = new ZabbixTriggerReq();
+					zabbixTriggerReq.setTriggerids(distinctTriggerIds);
+					zabbixTriggerReq.setOutput(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+					zabbixTriggerReq.setSelectFunctions(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+					List<ZabbixTrigger> zabbixTriggers = zabbixRPCTableService.getTriggerList(zabbixTriggerReq);
+					//查询items表，获取hostIds
+					List<String> distinctItemIds = getDistinctItemIds(zabbixTriggers,alarmViews);
+					ZabbixItemReq zabbixItemReq = new ZabbixItemReq();
+					zabbixItemReq.setItemids(distinctItemIds);
+					zabbixItemReq.setOutput(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+					List<ZabbixItemResp> zabbixItems = zabbixRPCTableService.getItemList(zabbixItemReq);
+					//查询host表，获取host表Name数据
+					List<String> distinctHostIds = getDistinctHostIds(zabbixItems,alarmViews);
+					ZabbixHostReq zabbixHostReq = new ZabbixHostReq();
+					zabbixHostReq.setHostids(distinctHostIds);
+					zabbixHostReq.setOutput(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+					List<ZabbixHostResp> zabbixHosts = zabbixRPCTableService.getHostList(zabbixHostReq);
+					setHostValues(zabbixHosts, alarmViews);
+					return alarmViews;
+				}
+			}
+		}
+		return null;
+	}
+
+	@Override
+	public List<AlarmView> newGetAlarmList(String userId, long frmTime, long endTime,String resourceType,String instanceInfo) throws ServiceException {
+		//获取用户所拥有项目下主机信息，再根据主机信息获取trigger信息，再读取event表
+		List<Host> hosts=hostDao.queryRelatedHostByUserId(userId,resourceType,instanceInfo);
+        List<String> hostNames=null;
+		if(hosts!=null && hosts.size()>0){
+			hostNames=new ArrayList<String>();
+			for(Host host:hosts){
+				hostNames.add(host.getHostName());
+			}
+		}
+		if(hostNames!=null && hostNames.size()>0) {
+			ZabbixHostReq zabbixHostReq = new ZabbixHostReq();
+			zabbixHostReq.setHost(hostNames);
+			zabbixHostReq.setOutput(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+			zabbixHostReq.setSelectTriggers(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+			List<ZabbixHostResp> zabbixHosts = zabbixRPCTableService.getHostList(zabbixHostReq);
+			List<AlarmView> alarmViews = null;
+			if (zabbixHosts != null && zabbixHosts.size() > 0) {
+				alarmViews = new ArrayList<AlarmView>();
+				for (ZabbixHostResp zabbixHostResp : zabbixHosts) {
+					List<String> triggerIds = null;
+					if (zabbixHostResp.getTriggers() != null && zabbixHostResp.getTriggers().size() > 0) {
+						triggerIds = new ArrayList<String>();
+						for (ZabbixTrigger zabbixTrigger : zabbixHostResp.getTriggers()) {
+							triggerIds.add(zabbixTrigger.getTriggerid());
+						}
+						List<ZabbixEvent> hostEvents = getHostEvents(triggerIds, frmTime, endTime);
+						if (hostEvents != null && hostEvents.size() > 0) {
+							for (ZabbixEvent zabbixEvent : hostEvents) {
+								AlarmView alarmView = new AlarmView();
+								alarmView.setHostId(zabbixHostResp.getHostid());
+								alarmView.setResourceName(zabbixHostResp.getName());
+								alarmView.setResourceDescrp(zabbixHostResp.getHost());
+								alarmView.setEventId(zabbixEvent.getEventid());
+								alarmView.setTriggerId(zabbixEvent.getObjectid());
+								alarmView.setHappenTime(sdf.format(new Date(Long.parseLong(zabbixEvent.getClock() + "000"))));
+								if (zabbixEvent.getAcknowledged().equals("0")) {
+									alarmView.setAcknowledged("N");
+								} else {
+									alarmView.setAcknowledged("Y");
+									//获取处理记录acknowledge表信息
+									setDealRecordValues(alarmView, zabbixEvent.getAcknowledges());
+								}
+								ZabbixTrigger zabbixTrigger = getOneZabbixTrigger(zabbixHostResp.getTriggers(), zabbixEvent.getObjectid());
+								int priority= Integer.parseInt(zabbixTrigger.getPriority());
+								switch (priority){
+									case 1:alarmView.setAlarmLevel("通告");break;
+									case 2:alarmView.setAlarmLevel("警告");break;
+									case 3:alarmView.setAlarmLevel("平均");break;
+									case 4:alarmView.setAlarmLevel("严重");break;
+									case 5:alarmView.setAlarmLevel("灾难");break;
+									default:alarmView.setAlarmLevel("未分类");
+								}
+								if (zabbixTrigger.getStatus().equals("0")) {
+									alarmView.setAlarmStatus("发生");
+								} else {
+									alarmView.setAlarmStatus("关闭");
+								}
+								alarmView.setAlarmDescrp(zabbixTrigger.getDescription());
+								alarmViews.add(alarmView);
+							}
+						}
+					}
+				}
+			}
+			return alarmViews;
+		}
+		return null;
+	}
+
+	@Override
+	public boolean addDealRecord(String userId, String eventId, String message) throws ServiceException {
+		return zabbixRPCTableService.addAcknowledge(eventId,message);
+	}
+
+	/**########################### newGetAlarmList 用到的方法  ###################################*/
+	private List<ZabbixEvent> getHostEvents(List<String> triggerIds,long frmTime, long endTime){
+		//读取event表
+		ZabbixEventReq zabbixEventReq = new ZabbixEventReq();
+		zabbixEventReq.setObject("0");
+		zabbixEventReq.setObjectids(triggerIds);
+		zabbixEventReq.setOutput(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+		zabbixEventReq.setTime_from(frmTime);
+		zabbixEventReq.setTime_till(endTime);
+		//按照触发时间倒序排列
+		zabbixEventReq.setSortfield(new String[]{"clock","eventid"});
+		zabbixEventReq.setSortorder("DESC");
+		//显示事件已经确认的信息的参数设置
+		zabbixEventReq.setSelect_acknowledges(ZabbixConstants.ZABBIX_OUTPUT_DEFAULT);
+		List<ZabbixEvent> zabbixEvents = zabbixRPCTableService.getEventList(zabbixEventReq);
+		return zabbixEvents;
+	}
+
+	private ZabbixTrigger getOneZabbixTrigger(List<ZabbixTrigger> zabbixTriggers,String triggerId){
+		if(zabbixTriggers!= null && zabbixTriggers.size()>0){
+			for(ZabbixTrigger zabbixTrigger : zabbixTriggers){
+				if(zabbixTrigger.getTriggerid().equals(triggerId)){
+					return zabbixTrigger;
+				}
+			}
+		}
+		return null;
+	}
+	/**########################### newGetAlarmList 用到的方法  ###################################*/
+
+	/**########################### getAlarmList 用到的方法  ###################################*/
+	private List<String> getDistinctEventIds(List<ZabbixAlert> list){
+		List<String> eventIds=null;
+		if(list!=null && list.size()>0){
+			eventIds=new ArrayList<String>();
+			for(ZabbixAlert zabbixAlert : list) {
+				if (!eventIds.contains(zabbixAlert.getEventid())){
+					eventIds.add(zabbixAlert.getEventid());
+				}
+			}
+		}
+		return eventIds;
+	}
+
+	private List<String> getDistinctTriggerIds(List<ZabbixEvent> list,List<AlarmView> alarmViews){
+		List<String> triggerIds=null;
+		if(list!=null && list.size()>0){
+			triggerIds=new ArrayList<String>();
+			for(ZabbixEvent zabbixEvent : list) {
+				if (!triggerIds.contains(zabbixEvent.getObjectid())){
+					triggerIds.add(zabbixEvent.getObjectid());
+				}
+				AlarmView alarmView = new AlarmView();
+				alarmView.setEventId(zabbixEvent.getEventid());
+				alarmView.setTriggerId(zabbixEvent.getObjectid());
+				alarmView.setHappenTime(sdf.format(new Date(Long.parseLong(zabbixEvent.getClock()+"000"))));
+				if(zabbixEvent.getAcknowledged().equals("0")) {
+					alarmView.setAcknowledged("N");
+				}else{
+					alarmView.setAcknowledged("Y");
+					//获取处理记录acknowledge表信息
+					setDealRecordValues(alarmView,zabbixEvent.getAcknowledges());
+				}
+				alarmViews.add(alarmView);
+			}
+		}
+
+		return triggerIds;
+	}
+
+	private List<String> getDistinctItemIds(List<ZabbixTrigger> list,List<AlarmView> alarmViews){
+		List<String> itemIds=null;
+		if(list!=null && list.size()>0){
+			itemIds=new ArrayList<String>();
+			for(ZabbixTrigger zabbixTrigger : list) {
+				List<AlarmView> alarmViewsWithTrigger = getAlarmViewsByTriggerId(alarmViews, zabbixTrigger.getTriggerid());
+				if(alarmViewsWithTrigger!= null && alarmViewsWithTrigger.size()>0) {
+					for(AlarmView oneAlarmView : alarmViewsWithTrigger) {
+						int priority= Integer.parseInt(zabbixTrigger.getPriority());
+						switch (priority){
+							case 1:oneAlarmView.setAlarmLevel("通告");break;
+							case 2:oneAlarmView.setAlarmLevel("警告");break;
+							case 3:oneAlarmView.setAlarmLevel("平均");break;
+							case 4:oneAlarmView.setAlarmLevel("严重");break;
+							case 5:oneAlarmView.setAlarmLevel("灾难");break;
+							default:oneAlarmView.setAlarmLevel("未分类");
+						}
+						if(zabbixTrigger.getStatus().equals("0")){
+							oneAlarmView.setAlarmStatus("发生");
+						}else{
+							oneAlarmView.setAlarmStatus("关闭");
+						}
+						oneAlarmView.setAlarmDescrp(zabbixTrigger.getDescription());
+					}
+				}
+				if(zabbixTrigger.getFunctions()!=null && zabbixTrigger.getFunctions().size()>0) {
+					for (Functions functions : zabbixTrigger.getFunctions()) {
+						if (!itemIds.contains(functions.getItemid())) {
+							itemIds.add(functions.getItemid());
+						}
+						if(alarmViewsWithTrigger!= null && alarmViewsWithTrigger.size()>0) {
+							for (AlarmView oneAlarmView : alarmViewsWithTrigger) {
+								oneAlarmView.setItemId(functions.getItemid());
+							}
+						}
+					}
+				}
+			}
+		}
+		return itemIds;
+	}
+
+	private List<String> getDistinctHostIds(List<ZabbixItemResp> list,List<AlarmView> alarmViews){
+		List<String> hostIds=null;
+		if(list!=null && list.size()>0){
+			hostIds=new ArrayList<String>();
+			for(ZabbixItemResp zabbixItem : list) {
+				List<AlarmView> alarmViewsWithItem = getAlarmViewsByItemId(alarmViews, zabbixItem.getItemid());
+				if (!hostIds.contains(zabbixItem.getHostid())){
+					hostIds.add(zabbixItem.getHostid());
+				}
+				if(alarmViewsWithItem !=null && alarmViewsWithItem.size()>0){
+					for (AlarmView oneAlarmView : alarmViewsWithItem) {
+						oneAlarmView.setHostId(zabbixItem.getHostid());
+					}
+				}
+			}
+		}
+		return hostIds;
+	}
+
+	private void setHostValues(List<ZabbixHostResp> zabbixHosts,List<AlarmView> alarmViews){
+		if(zabbixHosts!=null && zabbixHosts.size()>0) {
+			for (ZabbixHostResp zabbixHostResp : zabbixHosts) {
+				List<AlarmView> alarmViewsWithHost = getAlarmViewsByHostId(alarmViews,zabbixHostResp.getHostid());
+				if(alarmViewsWithHost!=null && alarmViewsWithHost.size()>0) {
+					for(AlarmView oneAlarmView : alarmViewsWithHost) {
+						oneAlarmView.setResourceName(zabbixHostResp.getName());
+						oneAlarmView.setResourceDescrp(zabbixHostResp.getHost());
+					}
+				}
+			}
+		}
+	}
+	//当处理状态为“Y”时，获取并设置处理记录及确认信息条数
+	private void setDealRecordValues(AlarmView alarmView,List<ZabbixAcknowledge> acknowledges){
+		if(acknowledges!= null && acknowledges.size()>0){
+			alarmView.setDealRecordNum(acknowledges.size());
+			List<AlarmDealRecord> alarmDealRecords=new ArrayList<AlarmDealRecord>();
+			for(ZabbixAcknowledge zabbixAcknowledge : acknowledges){
+				AlarmDealRecord alarmDealRecord = new AlarmDealRecord();
+				alarmDealRecord.setOperateTime(sdf.format(new Date(Long.parseLong(zabbixAcknowledge.getClock()+"000"))));
+				alarmDealRecord.setOperator(zabbixAcknowledge.getAlias());
+				alarmDealRecord.setRemarks(zabbixAcknowledge.getMessage());
+				alarmDealRecords.add(alarmDealRecord);
+			}
+			alarmView.setAlarmDealRecords(alarmDealRecords);
+		}
+	}
+
+
+	private List<AlarmView> getAlarmViewsByTriggerId(List<AlarmView> alarmViews, String triggerId){
+		if(alarmViews!=null && alarmViews.size()>0){
+			List<AlarmView> alarmViewsWithTriggerId=new ArrayList<AlarmView>();
+			for(AlarmView alarmView : alarmViews){
+				if(!StringUtils.isEmpty(alarmView.getTriggerId()) && alarmView.getTriggerId().equals(triggerId)){
+					alarmViewsWithTriggerId.add(alarmView);
+				}
+			}
+			return alarmViewsWithTriggerId;
+		}
+		return null;
+	}
+
+	private List<AlarmView> getAlarmViewsByItemId(List<AlarmView> alarmViews, String itemId){
+		if(alarmViews!=null && alarmViews.size()>0){
+			List<AlarmView> alarmViewsWithItemId=new ArrayList<AlarmView>();
+			for(AlarmView alarmView : alarmViews){
+				if(!StringUtils.isEmpty(alarmView.getItemId()) && alarmView.getItemId().equals(itemId)){
+					alarmViewsWithItemId.add(alarmView);
+				}
+			}
+			return alarmViewsWithItemId;
+		}
+		return null;
+	}
+
+	private List<AlarmView> getAlarmViewsByHostId(List<AlarmView> alarmViews, String hostId){
+		if(alarmViews!=null && alarmViews.size()>0){
+			List<AlarmView> alarmViewsWithHostId=new ArrayList<AlarmView>();
+			for(AlarmView alarmView : alarmViews){
+				if(!StringUtils.isEmpty(alarmView.getHostId()) && alarmView.getHostId().equals(hostId)){
+					alarmViewsWithHostId.add(alarmView);
+				}
+			}
+			return alarmViewsWithHostId;
+		}
+		return null;
+	}
+
+	/**########################### getAlarmList 用到的方法  ###################################*/
+
+}
